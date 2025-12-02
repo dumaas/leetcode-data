@@ -321,5 +321,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    loop: asyncio.events.AbstractEventLoop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
