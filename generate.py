@@ -214,6 +214,7 @@ submissions_total: {submissions_total}
 submissions_accepted: {submissions_accepted}
 acceptance_rate: {acceptance_rate}
 freq_bar: {freq_bar}
+lists: []
 ---
 
 # {problem_id}. {title}
