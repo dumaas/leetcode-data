@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 """
-This script generates an Anki deck with all the leetcode problems currently
-known.
+This script generates a CSV with all the leetcode problems currently known.
 """
 
 import argparse
 import asyncio
 import logging
+import re
+from html import unescape
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Coroutine, List
+from typing import Dict, List
 
-# https://github.com/kerrickstaley/genanki
-import genanki  # type: ignore
+import polars as pl  # type: ignore
 from tqdm import tqdm  # type: ignore
 
 import leetcode_anki.helpers.leetcode
 
-LEETCODE_ANKI_MODEL_ID = 4567610856
-LEETCODE_ANKI_DECK_ID = 8589798175
-OUTPUT_FILE = "leetcode.apkg"
-ALLOWED_EXTENSIONS = {".py", ".go"}
+OUTPUT_FILE = "leetcode"
 
 
 logging.getLogger().setLevel(logging.INFO)
@@ -57,158 +54,270 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-class LeetcodeNote(genanki.Note):
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def strip_html(s: str) -> str:
+    """Remove HTML tags and unescape entities."""
+    return _TAG_RE.sub("", unescape(s))
+
+
+def normalize_difficulty(raw: str) -> str:
     """
-    Extended base class for the Anki note, that correctly sets the unique
-    identifier of the note.
+    Normalize LeetCode difficulty HTML to one of: 'easy', 'medium', 'hard'.
+
+    Examples:
+      "<font color='green'>Easy</font>"  -> "easy"
+      "  <b>Medium</b> "                 -> "medium"
     """
+    text = strip_html(raw).strip().lower()
+    if text not in {"easy", "medium", "hard"}:
+        raise Exception(f"Unexpected difficulty: {text}")
+    return text
 
-    @property
-    def guid(self) -> str:
-        # Hash by leetcode task handle
-        return genanki.guid_for(self.fields[0])
 
-
-async def generate_anki_note(
+async def generate_csv_row(
     leetcode_data: leetcode_anki.helpers.leetcode.LeetcodeData,
-    leetcode_model: genanki.Model,
     leetcode_task_handle: str,
-) -> LeetcodeNote:
-    """
-    Generate a single Anki flashcard
-    """
-    return LeetcodeNote(
-        model=leetcode_model,
-        fields=[
-            leetcode_task_handle,
-            str(await leetcode_data.problem_id(leetcode_task_handle)),
-            str(await leetcode_data.title(leetcode_task_handle)),
-            str(await leetcode_data.category(leetcode_task_handle)),
-            await leetcode_data.description(leetcode_task_handle),
-            await leetcode_data.difficulty(leetcode_task_handle),
-            "yes" if await leetcode_data.paid(leetcode_task_handle) else "no",
-            str(await leetcode_data.likes(leetcode_task_handle)),
-            str(await leetcode_data.dislikes(leetcode_task_handle)),
-            str(await leetcode_data.submissions_total(leetcode_task_handle)),
-            str(await leetcode_data.submissions_accepted(leetcode_task_handle)),
-            str(
-                int(
-                    await leetcode_data.submissions_accepted(leetcode_task_handle)
-                    / await leetcode_data.submissions_total(leetcode_task_handle)
-                    * 100
-                )
-            ),
-            str(await leetcode_data.freq_bar(leetcode_task_handle)),
-        ],
-        tags=await leetcode_data.tags(leetcode_task_handle),
-        # FIXME: sort field doesn't work doesn't work
-        sort_field=str(await leetcode_data.freq_bar(leetcode_task_handle)).zfill(3),
+) -> dict:
+    """Custom implementation WITHOUT genanki usage"""
+    # Fetch all fields
+    (
+        problem_id,
+        title,
+        title_slug,
+        category,
+        description,
+        difficulty_raw,
+        paid,
+        likes,
+        dislikes,
+        submissions_total,
+        submissions_accepted,
+        freq_bar,
+        tags_raw,
+    ) = await asyncio.gather(
+        leetcode_data.problem_id(leetcode_task_handle),
+        leetcode_data.title(leetcode_task_handle),
+        leetcode_data.title_slug(leetcode_task_handle),
+        leetcode_data.category(leetcode_task_handle),
+        leetcode_data.description(leetcode_task_handle),
+        leetcode_data.difficulty(leetcode_task_handle),
+        leetcode_data.paid(leetcode_task_handle),
+        leetcode_data.likes(leetcode_task_handle),
+        leetcode_data.dislikes(leetcode_task_handle),
+        leetcode_data.submissions_total(leetcode_task_handle),
+        leetcode_data.submissions_accepted(leetcode_task_handle),
+        leetcode_data.freq_bar(leetcode_task_handle),
+        leetcode_data.tags(leetcode_task_handle),
     )
+    # Normalize difficulty (HTML -> [easy|medium|hard])
+    difficulty = normalize_difficulty(difficulty_raw)
+    acceptance_rate = submissions_accepted / submissions_total * 100 if submissions_total else 0.0
+
+    # Normalize tags as a proper list
+    if isinstance(tags_raw, (list, tuple)):
+        tags = list(tags_raw)
+    elif tags_raw is None:
+        tags = []
+    else:
+        tags = [str(tags_raw)]
+
+    # Exclude difficulty from tags
+    tags = [t for t in tags if not str(t).startswith("difficulty-")]
+
+    return {
+        "problem_id": problem_id,
+        "title": title,
+        "title_slug": title_slug,
+        "category": category,
+        "description": description,
+        "difficulty": difficulty,
+        "paid": bool(paid),
+        "likes": likes,
+        "dislikes": dislikes,
+        "submissions_total": submissions_total,
+        "submissions_accepted": submissions_accepted,
+        "acceptance_rate": acceptance_rate,
+        "freq_bar": freq_bar,
+        "tags": tags,
+    }
 
 
-async def generate(
+def sanitize_filename(name: str) -> str:
+    """Remove characters that are problematic in filenames (Windows especially)."""
+    return re.sub(r'[\\/*?:"<>|]', "", name)
+
+
+def generate_obsidian_files(df: pl.DataFrame, out_dir: Path) -> None:
+    """Generate one Obsidian-ready Markdown file per problem"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for row in df.iter_rows(named=True):
+        problem_id = row["problem_id"]
+        title = row["title"]
+        slug = row["title_slug"]
+        description_html = row["description"]
+        difficulty = row["difficulty"]
+        category = row["category"]
+        paid = row["paid"]
+        likes = row["likes"]
+        dislikes = row["dislikes"]
+        submissions_total = row["submissions_total"]
+        submissions_accepted = row["submissions_accepted"]
+        acceptance_rate = row["acceptance_rate"]
+        freq_bar = row["freq_bar"]
+        tags = row["tags"]
+
+        # --- YAML-friendly tags (metadata only, lowercase slugs) ---
+        if tags:
+            # Multi-line list
+            tags_block = "\n".join(f"- {t}" for t in tags)
+            yaml_tags = f"tags:\n{tags_block}"
+        else:
+            # Valid YAML empty list
+            yaml_tags = "tags: []"
+
+        # --- Wikilinks (conceptual Obsidian tags) ---
+        # Remove difficulty-* tags
+        conceptual_tags = [
+            t for t in tags
+            if not str(t).startswith("difficulty-")
+        ]
+
+        # Convert slug-like tags to Pretty Names:
+        #   "hash-table" -> "Hash Table"
+        #   "two-pointers" -> "Two Pointers"
+        def prettify_tag(t: str) -> str:
+            return " ".join(word.capitalize() for word in t.replace("_", "-").split("-"))
+
+        tag_wikilinks = [f"[[{prettify_tag(t)}]]" for t in conceptual_tags]
+
+        # Difficulty wikilink
+        difficulty_wikilink = f"[[Difficulty {difficulty.capitalize()}]]"
+
+        # Always include difficulty
+        wikilinks = [difficulty_wikilink] + tag_wikilinks
+
+        # Build the Markdown list
+        wikilinks_block = "\n".join(f"- {w}" for w in wikilinks)
+
+        safe_title = sanitize_filename(title)
+        filename = out_dir / f"{problem_id} - {safe_title}.md"
+
+        md = f"""---
+id: {problem_id}
+title: "{title}"
+slug: {slug}
+url: "https://leetcode.com/problems/{slug}/"
+difficulty: {difficulty}
+category: {category}
+{yaml_tags}
+paid: {str(paid).lower()}
+likes: {likes}
+dislikes: {dislikes}
+submissions_total: {submissions_total}
+submissions_accepted: {submissions_accepted}
+acceptance_rate: {acceptance_rate}
+freq_bar: {freq_bar}
+---
+
+# {problem_id}. {title}
+
+## Description
+
+{description_html}
+
+---
+
+## Tags
+{wikilinks_block}
+
+---
+
+## Links
+- LeetCode: https://leetcode.com/problems/{slug}/
+"""
+
+        filename.write_text(md, encoding="utf-8")
+
+
+async def generate_csv(
     start: int, stop: int, page_size: int, list_id: str, output_file: str
 ) -> None:
-    """
-    Generate an Anki deck
-    """
-    leetcode_model = genanki.Model(
-        LEETCODE_ANKI_MODEL_ID,
-        "Leetcode model",
-        fields=[
-            {"name": "Slug"},
-            {"name": "Id"},
-            {"name": "Title"},
-            {"name": "Topic"},
-            {"name": "Content"},
-            {"name": "Difficulty"},
-            {"name": "Paid"},
-            {"name": "Likes"},
-            {"name": "Dislikes"},
-            {"name": "SubmissionsTotal"},
-            {"name": "SubmissionsAccepted"},
-            {"name": "SumissionAcceptRate"},
-            {"name": "Frequency"},
-            # TODO: add hints
-        ],
-        templates=[
-            {
-                "name": "Leetcode",
-                "qfmt": """
-                <h2>{{Id}}. {{Title}}</h2>
-                <b>Difficulty:</b> {{Difficulty}}<br/>
-                &#128077; {{Likes}} &#128078; {{Dislikes}}<br/>
-                <b>Submissions (total/accepted):</b>
-                {{SubmissionsTotal}}/{{SubmissionsAccepted}}
-                ({{SumissionAcceptRate}}%)
-                <br/>
-                <b>Topic:</b> {{Topic}}<br/>
-                <b>Frequency:</b>
-                <progress value="{{Frequency}}" max="100">
-                {{Frequency}}%
-                </progress>
-                <br/>
-                <b>URL:</b>
-                <a href='https://leetcode.com/problems/{{Slug}}/'>
-                    https://leetcode.com/problems/{{Slug}}/
-                </a>
-                <br/>
-                <h3>Description</h3>
-                {{Content}}
-                """,
-                "afmt": """
-                {{FrontSide}}
-                <hr id="answer">
-                <b>Discuss URL:</b>
-                <a href='https://leetcode.com/problems/{{Slug}}/discuss/'>
-                    https://leetcode.com/problems/{{Slug}}/discuss/
-                </a>
-                <br/>
-                <b>Solution URL:</b>
-                <a href='https://leetcode.com/problems/{{Slug}}/solution/'>
-                    https://leetcode.com/problems/{{Slug}}/solution/
-                </a>
-                <br/>
-                """,
-            }
-        ],
-    )
-    leetcode_deck = genanki.Deck(LEETCODE_ANKI_DECK_ID, Path(output_file).stem)
+    """Custom implementation for generating CSV"""
+    base_name = Path(output_file).name  # e.g. "leetcode"
+
+    output_dir = Path("output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    parquet_path = output_dir / f"{base_name}.parquet"
+    csv_path = output_dir / f"{base_name}.csv"
+    obsidian_dir = output_dir / f"{base_name}_obsidian"
 
     leetcode_data = leetcode_anki.helpers.leetcode.LeetcodeData(
         start, stop, page_size, list_id
     )
 
-    note_generators: List[Awaitable[LeetcodeNote]] = []
-
+    logging.info("Fetching problem handles")
     task_handles = await leetcode_data.all_problems_handles()
 
-    logging.info("Generating flashcards")
-    for leetcode_task_handle in task_handles:
-        note_generators.append(
-            generate_anki_note(leetcode_data, leetcode_model, leetcode_task_handle)
-        )
+    logging.info("Generating CSV rows")
 
-    for leetcode_note in tqdm(note_generators, unit="flashcard"):
-        leetcode_deck.add_note(await leetcode_note)
+    # Create tasks so we can drive them with tqdm using as_completed
+    tasks = [
+        asyncio.create_task(generate_csv_row(leetcode_data, handle))
+        for handle in task_handles
+    ]
 
-    genanki.Package(leetcode_deck).write_to_file(output_file)
+    rows: List[Dict[str, object]] = []
+    for coro in tqdm(asyncio.as_completed(tasks), total=len(tasks), unit="problem"):
+        row = await coro
+        rows.append(row)
+    
+    df = pl.DataFrame(rows)
+    df = df.select(
+        "problem_id",
+        "title",
+        "title_slug",
+        "category",
+        "description",
+        "difficulty",
+        "paid",
+        "likes",
+        "dislikes",
+        "submissions_total",
+        "submissions_accepted",
+        "acceptance_rate",
+        "freq_bar",
+        "tags",
+    ).sort("problem_id")
 
+    # 1) Write canonical Parquet
+    logging.info("Writing Parquet to %s", parquet_path)
+    df.write_parquet(str(parquet_path))
+
+    # 2) Write flattened CSV (tags joined by ",")
+    df_csv = df.with_columns(
+        pl.col("tags").list.join(",").alias("tags")
+    )
+    logging.info("Writing CSV to %s", csv_path)
+    df_csv.write_csv(str(csv_path))
+
+    # 3) Write Obsidian markdown files
+    logging.info("Writing Obsidian Markdown files to %s", obsidian_dir)
+    generate_obsidian_files(df, obsidian_dir)
 
 async def main() -> None:
-    """
-    The main script logic
-    """
     args = parse_args()
 
-    start, stop, page_size, list_id, output_file = (
-        args.start,
-        args.stop,
-        args.page_size,
-        args.list_id,
-        args.output_file,
+    await generate_csv(
+        start=args.start,
+        stop=args.stop,
+        page_size=args.page_size,
+        list_id=args.list_id,
+        output_file=args.output_file,
     )
-    await generate(start, stop, page_size, list_id, output_file)
 
 
 if __name__ == "__main__":
