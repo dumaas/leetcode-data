@@ -398,6 +398,13 @@ class LeetcodeData:
         data = self._get_problem_data(problem_slug)
         return data.title
 
+    async def title_slug(self, problem_slug: str) -> str:
+        """
+        Returns problem title slug
+        """
+        data = self._get_problem_data(problem_slug)
+        return data.title_slug
+
     async def category(self, problem_slug: str) -> float:
         """
         Returns problem category title
