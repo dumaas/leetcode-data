@@ -193,14 +193,8 @@ def generate_obsidian_files(df: pl.DataFrame, out_dir: Path) -> None:
 
         tag_wikilinks = [f"[[{prettify_tag(t)}]]" for t in conceptual_tags]
 
-        # Difficulty wikilink
-        difficulty_wikilink = f"[[Difficulty {difficulty.capitalize()}]]"
-
-        # Always include difficulty
-        wikilinks = [difficulty_wikilink] + tag_wikilinks
-
         # Build the Markdown list
-        wikilinks_block = "\n".join(f"- {w}" for w in wikilinks)
+        wikilinks_block = "\n".join(f"- {w}" for w in tag_wikilinks)
 
         safe_title = sanitize_filename(title)
         filename = out_dir / f"{problem_id} - {safe_title}.md"
